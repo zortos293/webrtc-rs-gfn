@@ -938,30 +938,23 @@ impl PeerConnectionInternal {
             return Ok(false);
         }
 
-        // Find existing video transceiver
+        // For GFN-style SSRC changes, we just acknowledge the SSRC is valid.
+        // The new SSRC's stream will be handled separately by handle_incoming_ssrc 
+        // which reads from it and routes to the MID-based track lookup.
+        // We return Ok(false) to let the normal MID/RID flow handle it,
+        // but since GFN doesn't send MID extensions, we need a different approach.
+        
+        // Check if we have an existing video transceiver
         let transceivers = self.rtp_transceivers.lock().await;
-        for t in transceivers.iter() {
-            if t.kind() == RTPCodecType::Video {
-                let receiver = t.receiver().await;
-                let incoming = TrackDetails {
-                    ssrcs: vec![ssrc],
-                    kind: RTPCodecType::Video,
-                    stream_id: video_stream_id.clone(),
-                    id: video_track_id.clone(),
-                    ..Default::default()
-                };
-
-                log::info!("Provisional SSRC: Routing {} to video (stream={}, id={})",
-                    ssrc, video_stream_id, video_track_id);
-
-                let t_clone = Arc::clone(t);
-                let handler = Arc::clone(&self.on_track_handler);
-                let mtu = self.setting_engine.get_receive_mtu();
-                drop(transceivers);
-
-                PeerConnectionInternal::start_receiver(mtu, &incoming, receiver, t_clone, handler).await;
-                return Ok(true);
-            }
+        let has_video = transceivers.iter().any(|t| t.kind() == RTPCodecType::Video);
+        drop(transceivers);
+        
+        if has_video {
+            log::info!("Provisional SSRC: Accepting undeclared SSRC {} for video (GFN mode)", ssrc);
+            // Return Ok(true) to tell caller this SSRC is handled.
+            // The rtp_stream passed to handle_incoming_ssrc will continue to be read
+            // by the existing track's read loop since we stored it via store_simulcast_stream.
+            return Ok(true);
         }
 
         log::warn!("Provisional SSRC: No video transceiver for SSRC {}", ssrc);
