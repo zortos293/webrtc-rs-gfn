@@ -846,6 +846,7 @@ impl PeerConnectionInternal {
         ssrc: SSRC,
         remote_description: &SessionDescription,
     ) -> Result<bool> {
+        log::debug!("handle_undeclared_ssrc: SSRC={}, media_sections={}", ssrc, remote_description.media_descriptions.len());
         // Original behavior: if only one media section, handle it directly
         if remote_description.media_descriptions.len() == 1 {
             let only_media_section = &remote_description.media_descriptions[0];
