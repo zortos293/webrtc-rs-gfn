@@ -837,67 +837,134 @@ impl PeerConnectionInternal {
         }
     }
 
+    /// Handle undeclared SSRC by routing it to an existing track.
+    /// 
+    /// GFN-compatible extension: handles mid-stream SSRC changes without MID extensions.
+    /// Mirrors libsrtp2's "provisional stream" feature (Bifrost2.dll).
     async fn handle_undeclared_ssrc(
         self: &Arc<Self>,
         ssrc: SSRC,
         remote_description: &SessionDescription,
     ) -> Result<bool> {
-        if remote_description.media_descriptions.len() != 1 {
+        // Original behavior: if only one media section, handle it directly
+        if remote_description.media_descriptions.len() == 1 {
+            let only_media_section = &remote_description.media_descriptions[0];
+            let mut stream_id = "";
+            let mut id = "";
+
+            for a in &only_media_section.attributes {
+                match a.key.as_str() {
+                    ATTR_KEY_MSID => {
+                        if let Some(value) = &a.value {
+                            let split: Vec<&str> = value.split(' ').collect();
+                            if split.len() == 2 {
+                                stream_id = split[0];
+                                id = split[1];
+                            }
+                        }
+                    }
+                    ATTR_KEY_SSRC => return Err(Error::ErrPeerConnSingleMediaSectionHasExplicitSSRC),
+                    SDP_ATTRIBUTE_RID => return Ok(false),
+                    _ => {}
+                };
+            }
+
+            let mut incoming = TrackDetails {
+                ssrcs: vec![ssrc],
+                kind: RTPCodecType::Video,
+                stream_id: stream_id.to_owned(),
+                id: id.to_owned(),
+                ..Default::default()
+            };
+            if only_media_section.media_name.media == RTPCodecType::Audio.to_string() {
+                incoming.kind = RTPCodecType::Audio;
+            }
+
+            let t = self
+                .add_transceiver_from_kind(
+                    incoming.kind,
+                    Some(RTCRtpTransceiverInit {
+                        direction: RTCRtpTransceiverDirection::Sendrecv,
+                        send_encodings: vec![],
+                    }),
+                )
+                .await?;
+
+            let receiver = t.receiver().await;
+            PeerConnectionInternal::start_receiver(
+                self.setting_engine.get_receive_mtu(),
+                &incoming,
+                receiver,
+                t,
+                Arc::clone(&self.on_track_handler),
+            )
+            .await;
+            return Ok(true);
+        }
+
+        // GFN extension: Handle multiple media sections
+        if !self.setting_engine.allow_provisional_ssrc {
             return Ok(false);
         }
 
-        let only_media_section = &remote_description.media_descriptions[0];
-        let mut stream_id = "";
-        let mut id = "";
+        log::info!("Provisional SSRC: routing undeclared SSRC {} to video track", ssrc);
 
-        for a in &only_media_section.attributes {
-            match a.key.as_str() {
-                ATTR_KEY_MSID => {
-                    if let Some(value) = &a.value {
-                        let split: Vec<&str> = value.split(' ').collect();
-                        if split.len() == 2 {
-                            stream_id = split[0];
-                            id = split[1];
+        // Find video media section info
+        let mut video_stream_id = String::new();
+        let mut video_track_id = String::new();
+        
+        for media_desc in &remote_description.media_descriptions {
+            if media_desc.media_name.media == "video" {
+                for a in &media_desc.attributes {
+                    if a.key == ATTR_KEY_MSID {
+                        if let Some(value) = &a.value {
+                            let split: Vec<&str> = value.split(' ').collect();
+                            if !split.is_empty() {
+                                video_stream_id = split[0].to_owned();
+                                if split.len() >= 2 {
+                                    video_track_id = split[1].to_owned();
+                                }
+                            }
                         }
                     }
                 }
-                ATTR_KEY_SSRC => return Err(Error::ErrPeerConnSingleMediaSectionHasExplicitSSRC),
-                SDP_ATTRIBUTE_RID => return Ok(false),
-                _ => {}
-            };
+                break;
+            }
         }
 
-        let mut incoming = TrackDetails {
-            ssrcs: vec![ssrc],
-            kind: RTPCodecType::Video,
-            stream_id: stream_id.to_owned(),
-            id: id.to_owned(),
-            ..Default::default()
-        };
-        if only_media_section.media_name.media == RTPCodecType::Audio.to_string() {
-            incoming.kind = RTPCodecType::Audio;
+        if video_stream_id.is_empty() {
+            log::warn!("Provisional SSRC: No video media section found");
+            return Ok(false);
         }
 
-        let t = self
-            .add_transceiver_from_kind(
-                incoming.kind,
-                Some(RTCRtpTransceiverInit {
-                    direction: RTCRtpTransceiverDirection::Sendrecv,
-                    send_encodings: vec![],
-                }),
-            )
-            .await?;
+        // Find existing video transceiver
+        let transceivers = self.rtp_transceivers.lock().await;
+        for t in transceivers.iter() {
+            if t.kind() == RTPCodecType::Video {
+                let receiver = t.receiver().await;
+                let incoming = TrackDetails {
+                    ssrcs: vec![ssrc],
+                    kind: RTPCodecType::Video,
+                    stream_id: video_stream_id.clone(),
+                    id: video_track_id.clone(),
+                    ..Default::default()
+                };
 
-        let receiver = t.receiver().await;
-        PeerConnectionInternal::start_receiver(
-            self.setting_engine.get_receive_mtu(),
-            &incoming,
-            receiver,
-            t,
-            Arc::clone(&self.on_track_handler),
-        )
-        .await;
-        Ok(true)
+                log::info!("Provisional SSRC: Routing {} to video (stream={}, id={})",
+                    ssrc, video_stream_id, video_track_id);
+
+                let t_clone = Arc::clone(t);
+                let handler = Arc::clone(&self.on_track_handler);
+                let mtu = self.setting_engine.get_receive_mtu();
+                drop(transceivers);
+
+                PeerConnectionInternal::start_receiver(mtu, &incoming, receiver, t_clone, handler).await;
+                return Ok(true);
+            }
+        }
+
+        log::warn!("Provisional SSRC: No video transceiver for SSRC {}", ssrc);
+        Ok(false)
     }
 
     async fn handle_incoming_ssrc(
